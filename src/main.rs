@@ -1,7 +1,7 @@
 use std::{
     cmp::min,
     collections::{HashMap, HashSet},
-    fmt::Debug,
+    fmt::{Debug, Display},
 };
 
 use anyhow::{anyhow, Result};
@@ -17,19 +17,19 @@ use walkdir::WalkDir;
 async fn main() -> Result<()> {
     let matches = App::new("mediawiki extension helper")
         .version("0.1.0")
-        .arg(Arg::new("proxy").long("proxy").takes_value(true))
+        .arg(Arg::new("proxy").short('p').takes_value(true))
         .subcommand(App::new("init").arg(Arg::new("version").index(1).help("x.x.x").required(true)))
         .subcommand(
             App::new("add")
-                // .arg(
-                //     Arg::new("type")
-                //         .help("ext or skin")
-                //         .takes_value(true)
-                //         .required(true),
-                // )
                 .arg(
                     Arg::new("ext")
                         .short('e')
+                        .multiple_values(true)
+                        .takes_value(true),
+                )
+                .arg(
+                    Arg::new("skin")
+                        .short('s')
                         .multiple_values(true)
                         .takes_value(true),
                 ),
@@ -49,17 +49,34 @@ async fn main() -> Result<()> {
         create_json(&version).await?;
         return Ok(());
     }
-    if let Some(args) = matches.subcommand_matches("add") {
+    if let Some(mut args) = matches.subcommand_matches("add") {
         let mut config = read_json().await?;
         ensure_dir().await?;
-        let exts = args.values_of("ext").unwrap().unique().collect_vec();
+        let mut plugins: Vec<(ExtType, &str)> = Vec::new();
+        if let Some(exts) = args.values_of("ext") {
+            plugins.append(
+                &mut exts
+                    .unique()
+                    .map(|ext| (ExtType::Extension, ext))
+                    .collect_vec(),
+            )
+        }
+        if let Some(skins) = args.values_of("skin") {
+            plugins.append(
+                &mut skins
+                    .unique()
+                    .map(|skin| (ExtType::Skin, skin))
+                    .collect_vec(),
+            )
+        }
+        if plugins.is_empty() {
+            return Ok(());
+        }
         let multi = MultiProgress::new();
-
-        let result = future::join_all(
-            exts.clone()
-                .into_iter()
-                .map(|ext| install_ext(&config.version, ext.to_string(), &multi, &client)),
-        );
+        let result =
+            future::join_all(plugins.clone().into_iter().map(|ext| {
+                install_ext(&config.version, ext.1.to_string(), ext.0, &multi, &client)
+            }));
         let result = result.await;
         // multi.clear()?;
         result
@@ -67,10 +84,17 @@ async fn main() -> Result<()> {
             .enumerate()
             .for_each(|(index, result)| match result {
                 Ok(hash) => {
-                    config.ext.insert(exts[index].to_string(), hash.to_string());
+                    match plugins[index].0 {
+                        ExtType::Extension => config
+                            .ext
+                            .insert(plugins[index].1.to_string(), hash.to_string()),
+                        ExtType::Skin => config
+                            .skin
+                            .insert(plugins[index].1.to_string(), hash.to_string()),
+                    };
                 }
                 Err(err) => {
-                    println!("{} install failed: {}", exts[index], err)
+                    println!("{} install failed: {}", plugins[index].1, err)
                 }
             });
         config.save().await?;
@@ -85,7 +109,6 @@ async fn ensure_dir() -> Result<()> {
 }
 async fn save_with_progress(
     resp: Response,
-    filename: &str,
     filepath: &str,
     total_size: u64,
     pb: &ProgressBar,
@@ -119,6 +142,19 @@ fn remove_git_ignore(base: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+#[derive(Clone)]
+enum ExtType {
+    Extension,
+    Skin,
+}
+impl Display for ExtType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtType::Extension => f.write_str("ext"),
+            ExtType::Skin => f.write_str("skin"),
+        }
+    }
 }
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 struct Version(String, String, String);
@@ -177,7 +213,7 @@ async fn install_mw(version: &Version, client: &Client) -> Result<()> {
     set_pb_style(&pb);
     pb.set_prefix(format!("mediawiki-{}", version.x_x_x()));
     let filepath = format!("./.wem/{}", filename);
-    save_with_progress(resp, &filename, &filepath, total_size, &pb).await?;
+    save_with_progress(resp, &filepath, total_size, &pb).await?;
     let status = unzip(&filepath, ".").await?;
     remove_git_ignore(".")?;
     pb.finish_with_message(format!(
@@ -235,34 +271,44 @@ struct Query {
 }
 #[derive(Deserialize, Debug)]
 struct Extdistbranches {
-    extensions: HashMap<String, HashMap<String, String>>,
+    extensions: Option<HashMap<String, HashMap<String, String>>>,
+    skins: Option<HashMap<String, HashMap<String, String>>>,
 }
 async fn fetch_ext_meta(
     version: &Version,
     name: &str,
+    kind: ExtType,
     client: &Client,
 ) -> Result<(String, String)> {
+    let mut query = vec![
+        ("action", "query"),
+        ("list", "extdistbranches"),
+        ("format", "json"),
+    ];
+    match kind {
+        ExtType::Extension => query.push(("edbexts", name)),
+        ExtType::Skin => query.push(("edbskins", name)),
+    }
     let meta = client
         .get("https://www.mediawiki.org/w/api.php")
-        .query(&[
-            ("action", "query"),
-            ("list", "extdistbranches"),
-            ("edbexts", name),
-            ("format", "json"),
-        ])
+        .query(&query)
         .send()
         .await?
         .json::<Resp>()
         .await?;
     let branch = version.rel();
-    let url = meta
-        .query
-        .extdistbranches
-        .extensions
+    let extdistbranches = meta.query.extdistbranches;
+    let map = match kind {
+        ExtType::Extension => extdistbranches
+            .extensions
+            .ok_or(anyhow!("skins not found"))?,
+        ExtType::Skin => extdistbranches.skins.ok_or(anyhow!("skins not found"))?,
+    };
+    let url = map
         .get(name)
-        .ok_or(anyhow!("ext {} not found", name))?
+        .ok_or(anyhow!("{} {} not found", kind, name))?
         .get(&branch)
-        .ok_or(anyhow!("ext {} version {} not found", name, branch))?;
+        .ok_or(anyhow!("{} {} version {} not found", kind, name, branch))?;
     let start = url.rfind("/").ok_or(anyhow!("wrong url {}", url))?;
     let filename = &url[start..];
     Ok((url.to_string(), filename.to_string()))
@@ -270,6 +316,7 @@ async fn fetch_ext_meta(
 async fn install_ext(
     version: &Version,
     name: String,
+    kind: ExtType,
     mutli: &MultiProgress,
     client: &Client,
 ) -> Result<String> {
@@ -277,14 +324,14 @@ async fn install_ext(
     pb.set_prefix(name.clone());
     pb.set_style(ProgressStyle::default_bar().template("{prefix}: {msg} {spinner:.green}"));
     pb.set_message("fetching meta...");
-    let (url, filename) = fetch_ext_meta(version, &name, client).await?;
+    let (url, filename) = fetch_ext_meta(version, &name, kind, client).await?;
     pb.set_message("downloading...");
     set_pb_style(&pb);
     let resp = client.get(&url).send().await?;
     let total_size = get_total_size(&resp, &url)?;
     pb.set_length(total_size);
     let filepath = format!(".wem/{}", filename);
-    save_with_progress(resp, &filename, &filepath, total_size, &pb).await?;
+    save_with_progress(resp, &filepath, total_size, &pb).await?;
     let target_path = format!("extensions/{}/", name);
     fs::create_dir_all(&target_path).await?;
     let status = unzip(&filepath, &target_path).await?;
