@@ -324,7 +324,7 @@ async fn install_ext(
     pb.set_prefix(name.clone());
     pb.set_style(ProgressStyle::default_bar().template("{prefix}: {msg} {spinner:.green}"));
     pb.set_message("fetching meta...");
-    let (url, filename) = fetch_ext_meta(version, &name, kind, client).await?;
+    let (url, filename) = fetch_ext_meta(version, &name, kind.clone(), client).await?;
     pb.set_message("downloading...");
     set_pb_style(&pb);
     let resp = client.get(&url).send().await?;
@@ -332,7 +332,14 @@ async fn install_ext(
     pb.set_length(total_size);
     let filepath = format!(".wem/{}", filename);
     save_with_progress(resp, &filepath, total_size, &pb).await?;
-    let target_path = format!("extensions/{}/", name);
+    let target_path = format!(
+        "{}/{}/",
+        match kind {
+            ExtType::Extension => "extensions",
+            ExtType::Skin => "skins",
+        },
+        name
+    );
     fs::create_dir_all(&target_path).await?;
     let status = unzip(&filepath, &target_path).await?;
     remove_git_ignore(&target_path)?;
